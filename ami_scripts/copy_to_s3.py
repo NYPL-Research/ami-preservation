@@ -200,10 +200,18 @@ def check_bucket(s3_client, filenames_list, bucket_name):
 
     to_upload = []
     for file in filenames_list:
-        if file in found_keys: continue
-        if any(ext in file for ext in ['flac', 'wav']):
-            if file.replace('flac', 'mp4').replace('wav', 'mp4') in found_keys: continue
-        to_upload.append(file)
+        found = file in found_keys
+        if not found and any(ext in file for ext in ['flac', 'wav']):
+            alt_key = file.replace('flac', 'mp4').replace('wav', 'mp4')
+            if alt_key in found_keys:
+                found = True
+        
+        if found:
+            print(f"  - {file}: Found")
+        else:
+            print(f"  - {file}: Not Found")
+            to_upload.append(file)
+            
     return to_upload
 
 def transcode_flac(input_path, output_path, dry_run=False):
@@ -270,10 +278,17 @@ def process_single_directory(directory, arguments, s3_client, bucket_name):
     }
 
     for bag in sorted(bags):
+        bag_id_match = re.findall(r'\d{6}', bag)
+        bag_name = bag_id_match[-1] if bag_id_match else os.path.basename(bag)
+        if arguments.check_only or arguments.check_and_upload:
+            print(f"\nChecking bag: {bag_name}")
+
         paths, names, media, jsons = get_files(bag)
         fn_map = {os.path.basename(p): p for p in paths}
 
         if not paths:
+            if arguments.check_only or arguments.check_and_upload:
+                print(f"  -> WARNING: No EM or SC files found in bag.")
             summary['em_sc_issue_bags'].append(bag)
             continue
 
@@ -301,6 +316,8 @@ def process_single_directory(directory, arguments, s3_client, bucket_name):
                         for ext in ['mp4', 'wav', 'flac', 'json']:
                             if f.lower().endswith(ext): summary['uploaded_counts'][ext] += 1
         else:
+            if arguments.check_only or arguments.check_and_upload:
+                print("  -> WARNING: Skipping bucket check due to validation errors (e.g. invalid filename, mismatching JSON, etc.).")
             if checks[0] is not True: summary['invalid_fn_ls'].extend(checks[0])
             if checks[1] is not True: summary['fn_mismatch_ls'].append(checks[1])
             if checks[2] is not True: summary['json_mismatch_ls'].append(checks[2])
@@ -312,8 +329,17 @@ def print_summary(args, summary):
     print(f"\n=== Summary: {summary['directory']} ===")
     print(f"Bags: {summary['num_bags_found']} | IDs: {summary['bag_ids']}")
     uc = summary['uploaded_counts']
-    print(f"{'[DRY RUN] ' if args.dry_run else ''}Uploaded: {uc['mp4']} MP4, {uc['wav']} WAV, {uc['flac']} FLAC, {uc['json']} JSON")
-    if summary['incomplete_in_bucket']: print(f"Needs Upload: {summary['incomplete_in_bucket']}")
+    
+    if args.check_only:
+        num_needs_upload = len(summary['incomplete_in_bucket'])
+        num_complete = summary['num_bags_found'] - num_needs_upload - len(summary['em_sc_issue_bags'])
+        print(f"Checks completed: {num_complete} complete, {num_needs_upload} incomplete, {len(summary['em_sc_issue_bags'])} empty/issues.")
+    else:
+        print(f"{'[DRY RUN] ' if args.dry_run else ''}Uploaded: {uc['mp4']} MP4, {uc['wav']} WAV, {uc['flac']} FLAC, {uc['json']} JSON")
+    
+    if summary['incomplete_in_bucket']: print(f"Needs Upload: {[os.path.basename(b) for b in summary['incomplete_in_bucket']]}")
+    if summary['em_sc_issue_bags']: print(f"Empty/Issue Bags: {[os.path.basename(b) for b in summary['em_sc_issue_bags']]}")
+    if summary['invalid_fn_ls']: print(f"Invalid Filenames: {summary['invalid_fn_ls']}")
     if summary['failed_uploads']: print(f"ERRORS: {len(summary['failed_uploads'])} files failed.")
 
 def main():
