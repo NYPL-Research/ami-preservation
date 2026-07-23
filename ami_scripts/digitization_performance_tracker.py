@@ -362,8 +362,27 @@ def display_monthly_output(df, args, fiscal=False):
     # Define the minimum percentage threshold
     min_percentage = 5.0
 
-    # Filter divisions based on percentage threshold
-    total_media_counts_by_division = total_media_counts_by_division[total_media_counts_by_division['Percentage'].str.rstrip('%').astype(float) >= min_percentage]
+    # Aggregate small slices into "Others" to maintain accurate representation
+    total_media_counts_by_division['Percentage_float'] = total_media_counts_by_division['Percentage'].str.rstrip('%').astype(float)
+    
+    above_thresh = total_media_counts_by_division[total_media_counts_by_division['Percentage_float'] >= min_percentage].copy()
+    below_thresh = total_media_counts_by_division[total_media_counts_by_division['Percentage_float'] < min_percentage].copy()
+    
+    if not below_thresh.empty:
+        others_aggregated = below_thresh.groupby('media_type').agg({
+            'Unique Items': 'sum',
+            'Total Items Per Media': 'first'
+        }).reset_index()
+        others_aggregated['bibliographic.vernacularDivisionCode'] = 'Others'
+        
+        others_aggregated['Percentage'] = (others_aggregated['Unique Items'] / others_aggregated['Total Items Per Media']) * 100
+        others_aggregated['Percentage'] = others_aggregated['Percentage'].apply(lambda x: f"{x:.2f}%")
+        
+        total_media_counts_by_division = pd.concat([above_thresh, others_aggregated], ignore_index=True)
+    else:
+        total_media_counts_by_division = above_thresh
+
+    total_media_counts_by_division = total_media_counts_by_division.drop(columns=['Percentage_float'])
 
     # Adjust regex to capture only up to the first significant identifier (up to version number)
     df_pm['core_id'] = df_pm['asset.referenceFilename'].str.extract(r'(^.+?)_v\d+')[0]
@@ -825,7 +844,7 @@ def save_plot_to_pdf(
 
         # Generate pie charts for each media type
         media_types = total_media_counts_by_division['media_type'].unique()
-        fig, axes = plt.subplots(nrows=1, ncols=len(media_types), figsize=(5 * len(media_types), 5))
+        fig, axes = plt.subplots(nrows=1, ncols=len(media_types), figsize=(5 * len(media_types), 6.5))
         if len(media_types) == 1:
             axes = [axes]  # Ensure axes is iterable for a single subplot
 
@@ -835,11 +854,17 @@ def save_plot_to_pdf(
             
             # Generate a pie chart
             colors = sns.color_palette("cubehelix", len(data))  
-            ax.pie(data['Unique Items'], labels=data['bibliographic.vernacularDivisionCode'], startangle=90, colors=colors)
+            wedges, _ = ax.pie(data['Unique Items'], startangle=90, colors=colors)
             ax.set_title(f'{media_type.title()} by Division', fontsize=16)
             ax.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle.
+            
+            # Use a legend instead of pie labels to prevent overlapping text for small slices
+            labels = [f"{div} ({pct})" for div, pct in zip(data['bibliographic.vernacularDivisionCode'], data['Percentage'])]
+            ax.legend(wedges, labels, loc="upper center", bbox_to_anchor=(0.5, 0.0), fontsize=10, frameon=False)
 
         plt.tight_layout()
+        # Adjust bottom to make room for the legend
+        fig.subplots_adjust(bottom=0.25)
         pdf.savefig(fig)  # Save the full figure with all pie charts
         plt.close(fig)
 
