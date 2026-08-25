@@ -274,7 +274,7 @@ def process_iso_with_makemkv(iso_path, output_directory):
         return None
 
 
-def build_ffmpeg_command(input_file, output_file, srt_files=None):
+def build_ffmpeg_command(input_file, output_file, srt_files=None, dar=None):
     if srt_files is None:
         srt_files = []
 
@@ -289,6 +289,9 @@ def build_ffmpeg_command(input_file, output_file, srt_files=None):
         "-b:a", "320000",
         "-ar", "48000"
     ])
+    if dar:
+        ffmpeg_command.extend(["-aspect", str(dar)])
+        
     ffmpeg_command.extend(["-map", "0:v", "-map", "0:a"])
     ffmpeg_command.append(str(output_file))
     return ffmpeg_command
@@ -787,6 +790,14 @@ def concatenate_mkvs(mkv_files):
             os.unlink(tmp_mkv_file.name)
         return None
 
+def get_container_dar(mkv_file):
+    cmd = ["ffmpeg", "-i", str(mkv_file)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    import re
+    match = re.search(r'\[SAR \d+:\d+ DAR (\d+:\d+)\]', result.stderr)
+    if match:
+        return match.group(1)
+    return None
 
 def transcode_mkv_files(
     mkv_directory,
@@ -818,7 +829,8 @@ def transcode_mkv_files(
 
             logging.info(f"Transcoding concatenated MKV to {output_file}")
             try:
-                ffmpeg_command = build_ffmpeg_command(concatenated_mkv, output_file, _generated_srts)
+                dar = get_container_dar(concatenated_mkv)
+                ffmpeg_command = build_ffmpeg_command(concatenated_mkv, output_file, _generated_srts, dar=dar)
                 subprocess.run(ffmpeg_command, check=True)
                 return True
             except subprocess.CalledProcessError as e:
@@ -869,7 +881,8 @@ def transcode_mkv_files(
             output_file = output_directory / f"{final_base_name}.mp4"
             logging.info(f"Transcoding {mkv_file} to {output_file}")
             try:
-                ffmpeg_command = build_ffmpeg_command(mkv_file, output_file, generated_srts)
+                dar = get_container_dar(mkv_file)
+                ffmpeg_command = build_ffmpeg_command(mkv_file, output_file, generated_srts, dar=dar)
                 subprocess.run(ffmpeg_command, check=True)
             except subprocess.CalledProcessError as e:
                 logging.error(f"Transcoding failed for {mkv_file}: {e}")
@@ -1034,6 +1047,10 @@ def main():
     )
 
     input_directory = Path(args.i)
+    if not input_directory.is_dir():
+        logging.error(f"Error: The input path (-i) must be a directory containing ISO files, not a single file.")
+        sys.exit(1)
+        
     output_directory = Path(args.o)
     output_directory.mkdir(parents=True, exist_ok=True)
 
