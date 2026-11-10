@@ -97,13 +97,16 @@ def transcode_video(input_file, video_format, duration_sec):
     output_file = "dvd_compliant.mpg"
 
     # --- Bitrate Calculation ---
-    # Target size in kbits. 4.7GB is ~4.37 GiB.
-    # We'll target 4400 MiB to be safe, leaving room for ISO overhead.
-    # 4400 MiB * 1024 (KiB) * 1024 (bytes) * 8 (bits) / 1000 (kbits)
-    target_size_kbits = 4400 * 1024 * 1024 * 8 / 1000
+    # A standard single-layer DVD-R holds exactly 4,700,000,000 bytes.
+    # We must account for MPEG-2 container muxing overhead (~4%) and ISO filesystem overhead.
+    # We use a safe target of 94% of the absolute max capacity: 4,418,000,000 bytes.
+    safe_target_bytes = 4700000000 * 0.94
+    
+    # Convert to kbits (FFmpeg uses base-1000 for bitrates, so 1k = 1000 bits)
+    target_size_kbits = (safe_target_bytes * 8) / 1000
     
     # Standard DVD audio bitrate (AC3)
-    audio_bitrate_k = 192  # You can set this to 224 or 256 if you prefer
+    audio_bitrate_k = 192  
     
     # Calculate the total bitrate available in kbit/s
     total_bitrate_k = target_size_kbits / duration_sec
@@ -111,14 +114,13 @@ def transcode_video(input_file, video_format, duration_sec):
     # Subtract the audio bitrate to get the target video bitrate
     video_bitrate_k = total_bitrate_k - audio_bitrate_k
     
-    # DVD Spec has a max video bitrate (around 8000-9800 kbit/s).
-    # We'll cap it at 8000k to be safe and compatible.
-    # This ensures very short videos don't get an insanely high bitrate.
+    # DVD Spec max video bitrate is ~9800 kbit/s, but total (video+audio) can't exceed 10.08 Mbps.
+    # Capping video at 8000k ensures safe playback compatibility on older hardware
+    # and prevents short videos from exceeding DVD spec limits.
     MAX_VIDEO_BITRATE_K = 8000
     if video_bitrate_k > MAX_VIDEO_BITRATE_K:
         video_bitrate_k = MAX_VIDEO_BITRATE_K
 
-    # Sanity check: if bitrate is too low, quality will be bad, but it will fit.
     if video_bitrate_k < 1000:
         print(f"Warning: Calculated video bitrate is very low ({int(video_bitrate_k)}k).")
         print("The video is likely too long for good quality on a single DVD.")
@@ -132,13 +134,13 @@ def transcode_video(input_file, video_format, duration_sec):
 
     cmd = [
         "ffmpeg", "-i", input_file,
-        "-target", target,          # Use preset for resolution, aspect ratio, etc.
-        "-b:v", video_bitrate_str,   # Override the average video bitrate
-        "-maxrate", max_rate_str,    # Set the max video bitrate
-        "-minrate", "0",             # Set the min video bitrate
-        "-bufsize", buffer_size_str, # Set the video buffer size
-        "-b:a", audio_bitrate_str,   # Explicitly set audio bitrate
-        "-acodec", "ac3",            # Ensure DVD-compliant AC3 audio
+        "-target", target,          
+        "-b:v", video_bitrate_str,   
+        "-maxrate", max_rate_str,    
+        "-minrate", "0",             
+        "-bufsize", buffer_size_str, 
+        "-b:a", audio_bitrate_str,   
+        "-acodec", "ac3",            
         output_file
     ]
     
