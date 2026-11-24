@@ -16,8 +16,9 @@ import json
 import csv
 import time
 import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple, Optional
-from urllib.parse import unquote
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -48,11 +49,13 @@ class PreservicaClient:
         password: str,
         tenant: str,
         base_url: str = "https://nypl.preservica.com",
+        pool_maxsize: int = 10,
     ):
         self.base_url = base_url.rstrip('/')
         self.username = username
         self.password = password
         self.tenant = tenant
+        self._auth_lock = threading.Lock()
 
         # Configure session with robust retries for network-level failures
         self.session = requests.Session()
@@ -63,7 +66,11 @@ class PreservicaClient:
             allowed_methods=["GET", "POST"],
             raise_on_status=False
         )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=pool_maxsize,
+            pool_maxsize=pool_maxsize,
+        )
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
 
@@ -101,9 +108,10 @@ class PreservicaClient:
         resp = self.session.get(url, **kwargs)
         if resp.status_code == 401:
             logging.info("Token expired, re-authenticating")
-            self._authenticate()
+            with self._auth_lock:
+                self._authenticate()
             resp = self.session.get(url, **kwargs)
-        
+
         # We don't raise_for_status() immediately because we need to handle 206/416 manually
         return resp
 
@@ -112,7 +120,8 @@ class PreservicaClient:
         kwargs.setdefault('timeout', (10, 60))
         resp = self.session.post(url, **kwargs)
         if resp.status_code == 401:
-            self._authenticate()
+            with self._auth_lock:
+                self._authenticate()
             resp = self.session.post(url, **kwargs)
         resp.raise_for_status()
         return resp
@@ -184,7 +193,7 @@ class PreservicaClient:
                 return val[0].strip(), alg[0].strip().lower()
         return None, None
 
-    def download_bitstream(self, co_uuid: str, output_dir: str):
+    def download_bitstream(self, co_uuid: str, output_dir: str) -> bool:
         os.makedirs(output_dir, exist_ok=True)
         base_path = f"/api/entity/content-objects/{co_uuid}/generations/latest-active/bitstreams/1"
         content_path = f"{base_path}/content"
@@ -206,7 +215,8 @@ class PreservicaClient:
         # 2. Resumable Download Loop
         retries = 0
         max_retries = 30
-        
+        last_logged_at = 0.0
+
         while True:
             current_pos = os.path.getsize(part_path) if os.path.exists(part_path) else 0
 
@@ -221,7 +231,22 @@ class PreservicaClient:
                 with self.get(content_path, headers=headers, stream=True) as resp:
                     if resp.status_code == 416: # Range Not Satisfiable
                         break
-                    
+
+                    if resp.status_code not in (200, 206):
+                        retries += 1
+                        if retries > max_retries:
+                            logging.error(
+                                "Failed after %d retries for %s (HTTP %d)",
+                                max_retries, filename, resp.status_code
+                            )
+                            return False
+                        time.sleep(min(retries * 5, 60))
+                        logging.warning(
+                            "Unexpected HTTP %d for %s. Retrying %d/%d...",
+                            resp.status_code, filename, retries, max_retries
+                        )
+                        continue
+
                     # If 206 Partial Content, we append. If 200, we start over.
                     mode = 'ab' if resp.status_code == 206 else 'wb'
                     if mode == 'wb':
@@ -233,13 +258,17 @@ class PreservicaClient:
                                 f.write(chunk)
                                 current_pos += len(chunk)
                                 retries = 0 # Successful data received; reset retry counter
-                                
-                                if total_size:
-                                    pct = (current_pos / total_size) * 100
-                                    sys.stdout.write(f"\r{pct:6.2f}% | {filename}")
-                                else:
-                                    sys.stdout.write(f"\r{current_pos} bytes | {filename}")
-                                sys.stdout.flush()
+
+                                # Throttle progress logging so concurrent downloads
+                                # don't flood the log; one line per file per ~5s.
+                                now = time.monotonic()
+                                if now - last_logged_at >= 5:
+                                    last_logged_at = now
+                                    if total_size:
+                                        pct = (current_pos / total_size) * 100
+                                        logging.info("%s: %.2f%%", filename, pct)
+                                    else:
+                                        logging.info("%s: %d bytes", filename, current_pos)
 
                 # Re-check size after chunking finishes
                 if total_size and current_pos >= total_size:
@@ -248,12 +277,10 @@ class PreservicaClient:
             except (ChunkedEncodingError, ConnectionError, ProtocolError, ReadTimeout) as e:
                 retries += 1
                 if retries > max_retries:
-                    logging.error(f"\nFailed after {max_retries} retries for {filename}")
-                    return
+                    logging.error("Failed after %d retries for %s", max_retries, filename)
+                    return False
                 time.sleep(min(retries * 5, 60))
-                print(f"\nInterrupted. Retrying {retries}/{max_retries}...")
-
-        print() # Newline after progress bar
+                logging.warning("Interrupted (%s). Retrying %d/%d...", e, retries, max_retries)
 
         # 3. Fixity Verification and Atomic Rename
         if expected_hash and hash_algo in ['md5', 'sha1', 'sha256']:
@@ -268,11 +295,12 @@ class PreservicaClient:
                 logging.error(f"Fixity mismatch for {filename}! Expected: {expected_hash}, Got: {actual_hash}")
                 logging.warning(f"Deleting corrupted file: {part_path}")
                 os.remove(part_path)
-                return
+                return False
 
         # Final move from .part to real filename
         os.rename(part_path, filepath)
         logging.info(f"Download complete: {filename}")
+        return True
 
 
 # --- CLI / Main -------------------------------------------------------------
@@ -311,6 +339,8 @@ def parse_args():
     parser.add_argument("--config-file", default=None)
     parser.add_argument("-r", "--representation", choices=["access", "production", "preservation"], default="production")
     parser.add_argument("-o", "--output", default=".")
+    parser.add_argument("-w", "--workers", type=int, default=1,
+                         help="Number of files to download concurrently (default: 1)")
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser.parse_args()
 
@@ -323,20 +353,43 @@ def main():
 
     ami_ids = read_ids_from_csv(args.csv) if args.csv else args.ids
     user, pw, tenant = load_credentials(args.config_file)
-    client = PreservicaClient(user, pw, tenant)
+    client = PreservicaClient(user, pw, tenant, pool_maxsize=max(10, args.workers * 2))
 
     rep_map = {"access": "access_1", "production": "preservation_2", "preservation": "preservation_1"}
     results = client.search_ami(ami_ids)
 
+    # Resolve every AMI ID to its content-object UUIDs first (cheap metadata
+    # calls), then fan the actual bitstream downloads out across a thread pool.
+    co_uuids: List[str] = []
     for title, io_uuid in results:
         if not (title and io_uuid): continue
         spec = rep_map[args.representation]
         try:
-            co_uuids = client.get_content_object_uuids(io_uuid, spec)
-            for co in co_uuids:
-                client.download_bitstream(co, args.output)
+            co_uuids.extend(client.get_content_object_uuids(io_uuid, spec))
         except PreservicaError as e:
             logging.error("Error processing %s: %s", io_uuid, e)
+
+    succeeded = failed = 0
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {
+            executor.submit(client.download_bitstream, co, args.output): co
+            for co in co_uuids
+        }
+        for future in as_completed(futures):
+            co = futures[future]
+            try:
+                ok = future.result()
+            except Exception as e:
+                logging.error("Error downloading content object %s: %s", co, e)
+                ok = False
+            if ok:
+                succeeded += 1
+            else:
+                failed += 1
+
+    logging.info("Downloaded %d/%d files successfully", succeeded, succeeded + failed)
+    if failed:
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
